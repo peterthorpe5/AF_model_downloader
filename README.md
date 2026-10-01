@@ -1,152 +1,149 @@
 # Standalone AlphaFold Database downloader
 
-This Python 3.10+ command retrieves **published AlphaFold Database predictions**.
-It does not run AlphaFold inference. It accepts one explicitly selected type of
-input per run:
+This Python 3.10+ command retrieves **published AlphaFold Database models**;
+it does not predict structures. It maps protein accessions through UniProt
+before requesting a canonical AlphaFold Database F1 model. It needs only the
+Python standard library.
 
-- NCBI RefSeq **protein** accessions, such as `NP_000537.3`;
-- numeric NCBI **Gene IDs**, such as `7157`;
-- UniProt accessions, such as `P04637`.
+Supported `--id-type` choices:
 
-The NCBI types are mapped using UniProt's current ID mapping service. The
-AlphaFold Database prediction endpoint is then queried using each mapped
-UniProt accession. A Gene ID can map to several UniProt proteins; **all**
-mappings are recorded and requested. No arbitrary isoform is chosen. IDs with
-no mapping and proteins with no published model have distinct statuses.
+| Type | Example | Input |
+| --- | --- | --- |
+| `ncbi-protein` | `AAB61673.1`, `NP_009225.1` | A mixed list of INSDC GenBank/ENA/DDBJ and RefSeq **protein** accessions |
+| `genbank-protein` | `AAB61673.1` | INSDC GenBank/ENA/DDBJ CDS **protein** accessions |
+| `refseq-protein` | `NP_000537.3` | RefSeq **protein** accessions |
+| `gene-id` | `7157` | Numeric NCBI Gene IDs; one gene may yield several UniProt proteins |
+| `uniprot` | `P04637` | UniProt accessions without an ID mapping job |
 
-The script needs Python's standard library only. It accesses
-`rest.uniprot.org` for NCBI ID mapping and `alphafold.ebi.ac.uk` for model
-metadata and files. It follows redirects only within each original host.
-The `examples/` directory contains one-column starter lists for each ID type.
+For `ncbi-protein`, the command automatically submits separate UniProt mapping
+jobs for RefSeq proteins and INSDC protein accessions. It retains **every**
+UniProt match and records both accession types in `manifest.tsv`. A valid
+mapping does not prove that the original protein has the same sequence as the
+UniProt model. Use a protein FASTA to check sequence identity before download.
 
-## Example commands
+## Quick start: one or more accessions
 
-Unpack the supplied ZIP, change to the unpacked directory, then run:
+Unpack the ZIP and change to the `afdb_ncbi_downloader` directory.
 
 ```bash
-# One RefSeq protein accession; download mmCIF and available PAE JSON.
 python3 fetch_alphafold_models.py \
-  --id-type refseq-protein \
-  --id NP_000537.3 \
-  --output-dir "$HOME/alphafold_refseq_example" \
+  --id-type ncbi-protein \
+  --id AAB61673.1 \
+  --id NP_009225.1 \
+  --output-dir "$HOME/alphafold_mixed_example" \
   --include-pae
 ```
 
-```bash
-# One NCBI Gene ID. The manifest can list more than one mapped protein.
-python3 fetch_alphafold_models.py \
-  --id-type gene-id \
-  --id 7157 \
-  --output-dir "$HOME/alphafold_gene_example"
-```
-
-```bash
-# Several UniProt accessions, requesting PDB rather than mmCIF files.
-python3 fetch_alphafold_models.py \
-  --id-type uniprot \
-  --id P04637 \
-  --id Q39090 \
-  --format pdb \
-  --output-dir "$HOME/alphafold_uniprot_example"
-```
-
-For a list, place **one ID per line, without a header**, in a UTF-8 text file.
-Blank lines and lines beginning with `#` are ignored:
+For a list, make a UTF-8 text file with **one accession per line and no
+header**. Blank lines and lines beginning with `#` are ignored:
 
 ```text
-NP_000537.3
-XP_012345678.1
+AAB61673.1
+NP_009225.1
 ```
 
 ```bash
 python3 fetch_alphafold_models.py \
-  --id-type refseq-protein \
-  --ids-file "$HOME/refseq_proteins.txt" \
-  --output-dir "$HOME/alphafold_batch_example"
+  --id-type ncbi-protein \
+  --ids-file "$HOME/my_protein_accessions.txt" \
+  --output-dir "$HOME/alphafold_mixed_batch" \
+  --include-pae
 ```
 
-`XP_012345678.1` illustrates the input format; it is not a promise that a
-mapping or published model exists. Output directories must be **new or empty**
-so existing work cannot be overwritten. The `--id-type` applies to every ID in
-that run. The default limit is 50 distinct mapped models per run; increase it
-explicitly with `--max-models` (maximum 500) if needed. The `--id-type` applies
-to every ID in that run. Use separate invocations for different types of ID.
-`--help` lists all options.
+Output directories must be **new or empty**. The command refuses to overwrite
+an earlier run. The default limit is 50 distinct models; use `--max-models 100`
+to raise it when needed (maximum 500). For a different request, pick a new
+output directory.
 
-## Optional exact sequence check
+## Preferred: supply the actual protein sequences
 
-When the input protein sequence is available, provide an unaligned FASTA file
-with headers containing the original input IDs. Every requested ID must have
-exactly one record:
+If you have a multi-FASTA, you can use it as the **only input file**. Each
+header must start with the NCBI **protein** accession, preferably with its version;
+the remaining description is ignored. Sequences must be unaligned. Use the
+real sequences from NCBI or your analysed data, not the abbreviated example
+below:
 
 ```text
->NP_000537.3
-MEEPQSDPSVEPPLSQETFSDLWKLLPENNVLSPLPSQAMDDLMLSPDDIEQWFTEDPGP
-...
+>AAB61673.1 protein description
+THE_COMPLETE_PROTEIN_SEQUENCE_HERE
+>NP_009225.1 protein description
+THE_COMPLETE_PROTEIN_SEQUENCE_HERE
 ```
 
 ```bash
 python3 fetch_alphafold_models.py \
-  --id-type refseq-protein \
-  --ids-file "$HOME/refseq_proteins.txt" \
-  --sequence-fasta "$HOME/refseq_proteins.faa" \
-  --output-dir "$HOME/alphafold_checked_example"
+  --id-type ncbi-protein \
+  --protein-fasta "$HOME/my_proteins.faa" \
+  --output-dir "$HOME/alphafold_checked_batch" \
+  --include-pae
 ```
 
-The script compares each FASTA sequence to the **UniProt sequence reported in
-AlphaFold Database metadata**. It does not download a model when they differ
-or when the metadata lack a sequence. This checks the identifier mapping
-against the supplied sequence; it is not a coordinate-level residue check.
-Without `--sequence-fasta`, the manifest says `NOT_PROVIDED` rather than
-claiming sequence identity. Do not use the abbreviated FASTA illustration
-above as an actual input record.
+The command compares each submitted sequence with the full UniProt sequence
+reported by AlphaFold Database. It downloads a model for an input only when
+the sequences match **exactly**. If they differ, the manifest keeps the ID
+conversion but reports `SEQUENCE_MISMATCH` and writes no input-named model for
+that record. This is a mapping check, not a coordinate-level residue check.
+For an accession list and a separate FASTA, use `--ids-file` together with
+`--sequence-fasta`; the FASTA must contain exactly the same accession headers.
 
-## Output and interpretation
+**Ken's example needs care:** UniProt identifies `AAB61673.1` as a BRCA1
+cross-reference but annotates its translated sequence as different from the
+curated BRCA1 sequence, with an erroneous CDS choice. A mapping to `P38398`
+must therefore **not** be described as an exact structure for `AAB61673.1`
+without checking the actual sequences. The FASTA mode will flag a mismatch
+against the canonical model rather than silently substituting it. With an
+accession-only list, the manifest says `NOT_PROVIDED` for the sequence check.
+
+There is no guarantee that an accession has a UniProt mapping or that a
+mapped UniProt protein has a published canonical model. The script reports
+these separately as `UNMAPPED` and `MODEL_NOT_AVAILABLE`; it does not treat a
+related protein as a verified structural match.
+
+## Files and naming
 
 ```text
 OUTPUT_DIR/
   manifest.tsv
   models/
-    AF-<UniProt accession>-F1-model_v<version>.cif
-    AF-<UniProt accession>-F1-predicted_aligned_error_v<version>.json
+    AF-<UniProt>-F1-model_v<version>.cif
+    AF-<UniProt>-F1-predicted_aligned_error_v<version>.json
+  by_input/
+    <submitted ID>__<UniProt>__AF-<UniProt>-F1-model_v<version>.cif
+    <submitted ID>__<UniProt>__AF-<UniProt>-F1-predicted_aligned_error_v<version>.json
 ```
 
-The manifest retains the input ID and type, every mapped UniProt accession,
-model source URL and version, SHA-256 checksum, relative path, PAE outcome,
-sequence comparison status, and a clear result status:
+`manifest.tsv` is the accession conversion table. It records `input_id`,
+`mapping_source`, `uniprot_accession`, `status`, the canonical `model_path`,
+the accession-labelled `named_model_path`, the corresponding PAE paths when
+requested, SHA-256 checksums, model version, sequence check and error details.
+Each mapped UniProt accession gets its own row. The `by_input/` names preserve
+the accession supplied by Ken or Maddy and identify the actual UniProt model.
+The canonical file is downloaded once per UniProt accession; input-named
+files use hard links where possible or a copy when links are unavailable.
+The model path stays empty for unmapped, unavailable or mismatching input IDs.
 
-- `DOWNLOADED`: an available canonical F1 model was written (or reused within
-  this run for another ID mapped to the same UniProt accession);
-- `UNMAPPED`: UniProt supplied no accession for this input ID;
-- `MODEL_NOT_AVAILABLE`: no canonical F1 model of the requested format was
-  available from AlphaFold Database;
-- `SEQUENCE_MISMATCH`: the optional input FASTA did not match AlphaFold
-  metadata, and no model was downloaded for that input ID;
-- `FAILED`: a service, response-validation or file error occurred. Inspect
-  `detail` and rerun into a fresh output directory.
+Other statuses: `DOWNLOADED` means a model was written; `FAILED` means an API,
+validation or file error. Inspect `detail` and rerun into a fresh directory.
+The command exits `0` when all requests have a known outcome (including
+unmapped or unavailable models), `1` for failed requests or requested PAE
+failures, and `2` for invalid input or another fatal error. Use `--help` for
+all available options.
 
-The command exits `0` when requests finished, including known unavailable
-models; it exits `1` when one or more model requests or explicitly requested
-PAE files failed, and `2` for an invalid input or other fatal error. PAE
-failures are recorded in `pae_status`. A model file is stored once per UniProt accession even when
-several input IDs resolve to it. The canonical F1 selection excludes other
-fragments and isoforms; their existence does not imply a matching F1 model.
-
-These are AlphaFold Database predictions and associated confidence data.
-There is no AlphaFold 3 pTM/ipTM or AF3 ranking score in these downloads.
+These are AlphaFold Database predictions with pLDDT and, where available,
+PAE. The downloads do not have AlphaFold 3 pTM, ipTM or ranking scores.
 
 ## Test
-
-All included tests use stubbed HTTP responses and make **no network calls**:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-The authoring environment could not connect to UniProt or AlphaFold Database,
-so the packaged version was not validated against their live services. The
-first small example above is a suitable live smoke test on a machine with
-internet access. Check `manifest.tsv` before using any model in an analysis.
+The included tests use controlled HTTP responses and make **no network
+calls**. The authoring environment could not make a live UniProt/AlphaFold
+request. Run a small smoke test on a machine with internet access and inspect
+`manifest.tsv` before relying on any mapping.
 
-API references: [UniProt ID mapping](https://www.uniprot.org/api-documentation/idmapping)
+Sources: [UniProt's current ID mapping fields](https://rest.uniprot.org/configure/idmapping/fields),
+[NCBI accession formats](https://www.ncbi.nlm.nih.gov/genbank/acc_prefix/),
+[UniProt's annotation of AAB61673.1](https://www.uniprot.org/uniprotkb/P38398/entry),
 and the [AlphaFold Database API description](https://academic.oup.com/nar/article/50/D1/D439/6430488).

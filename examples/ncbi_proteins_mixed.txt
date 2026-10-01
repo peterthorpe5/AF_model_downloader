@@ -1,0 +1,3 @@
+# Example accession list; inspect the manifest after a live run.
+AAB61673.1
+NP_009225.1

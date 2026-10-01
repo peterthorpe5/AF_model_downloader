@@ -7,7 +7,6 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Self
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request
@@ -43,10 +42,13 @@ def model_metadata(
 class StubClient:
     """Return controlled service responses without network access."""
 
-    def __init__(self, *, responses: dict[str, bytes | Exception]) -> None:
+    def __init__(
+        self, *, responses: dict[str, bytes | Exception | list[bytes | Exception]]
+    ) -> None:
         """Store endpoint responses and calls for exact assertions."""
         self.responses = responses
         self.calls: list[str] = []
+        self.forms: list[dict[str, str] | None] = []
 
     def read(
         self,
@@ -58,7 +60,10 @@ class StubClient:
     ) -> bytes:
         """Return a fixture or raise a configured service error."""
         self.calls.append(url)
+        self.forms.append(form)
         response = self.responses[url]
+        if isinstance(response, list):
+            response = response.pop(0)
         if isinstance(response, Exception):
             raise response
         return response
@@ -71,7 +76,7 @@ class FakeResponse:
         """Keep the fake response payload."""
         self.data = data
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> FakeResponse:
         """Return this fake as a response stream."""
         return self
 
@@ -167,6 +172,44 @@ class IdentifierTests(unittest.TestCase):
             with self.assertRaisesRegex(downloader.DownloadError, "Empty"):
                 downloader.read_fasta(path=fasta, identifiers=("NP_001.1",))
 
+    def test_mixed_ncbi_protein_ids_and_nucleotide_rejection(self) -> None:
+        """Accept RefSeq and INSDC proteins in one list, not nucleotide IDs."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mixed.txt"
+            path.write_text(
+                "AAB61673.1\nNP_009225.1\nCAA12345.2\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                downloader.read_identifiers(
+                    identifier_type="ncbi-protein", ids=(), ids_file=path
+                ),
+                ("AAB61673.1", "NP_009225.1", "CAA12345.2"),
+            )
+        for identifier in ("AF005068.1", "NM_007294.3", "A12345.1"):
+            with self.subTest(identifier=identifier):
+                with self.assertRaises(downloader.DownloadError):
+                    downloader.validate_identifier(
+                        value=identifier, identifier_type="ncbi-protein"
+                    )
+        with self.assertRaises(downloader.DownloadError):
+            downloader.validate_identifier(
+                value="AAB61673.1", identifier_type="refseq-protein"
+            )
+
+    def test_primary_protein_fasta_keeps_accession_headers(self) -> None:
+        """Read actual submitted sequences and preserve accession versions."""
+        with tempfile.TemporaryDirectory() as directory:
+            fasta = Path(directory) / "proteins.faa"
+            fasta.write_text(
+                ">AAB61673.1 description\nMAKT\n>NP_009225.1\nMSS*\n",
+                encoding="utf-8",
+            )
+            sequences = downloader.read_fasta(path=fasta, identifiers=None)
+        self.assertEqual(
+            sequences, {"AAB61673.1": "MAKT", "NP_009225.1": "MSS"}
+        )
+
 
 class MappingTests(unittest.TestCase):
     """Check asynchronous UniProt ID mapping and all-result retention."""
@@ -225,6 +268,46 @@ class MappingTests(unittest.TestCase):
         )
         self.assertEqual(client.calls, [])
 
+    def test_mixed_proteins_are_mapped_by_correct_source(self) -> None:
+        """GenBank CDS and RefSeq proteins need separate UniProt jobs."""
+        base = downloader.ID_MAPPING_URL
+        client = StubClient(
+            responses={
+                f"{base}/run": [b'{"jobId":"REF1"}', b'{"jobId":"GB1"}'],
+                f"{base}/status/REF1": b'{"jobStatus":"FINISHED"}',
+                f"{base}/status/GB1": b'{"jobStatus":"FINISHED"}',
+                f"{base}/stream/REF1": json.dumps(
+                    {"results": [
+                        {"from": "NP_009225.1", "to": {"primaryAccession": "P38398"}}
+                    ]}
+                ).encode("utf-8"),
+                f"{base}/stream/GB1": json.dumps(
+                    {"results": [
+                        {"from": "AAB61673.1", "to": {"primaryAccession": "P38398"}}
+                    ]}
+                ).encode("utf-8"),
+            }
+        )
+        mapping = downloader.map_identifiers(
+            identifiers=("NP_009225.1", "AAB61673.1"),
+            identifier_type="ncbi-protein",
+            client=client,
+        )
+        self.assertEqual(
+            mapping,
+            {"NP_009225.1": ("P38398",), "AAB61673.1": ("P38398",)},
+        )
+        self.assertEqual(
+            [form["from"] for form in client.forms if form is not None],
+            ["RefSeq_Protein", "EMBL-GenBank-DDBJ_CDS"],
+        )
+        self.assertEqual(
+            downloader.mapping_source_for(
+                identifier="AAB61673.1", identifier_type="ncbi-protein"
+            ),
+            "EMBL-GenBank-DDBJ_CDS",
+        )
+
 
 class ModelTests(unittest.TestCase):
     """Check canonical model selection and file safety."""
@@ -272,6 +355,23 @@ class ModelTests(unittest.TestCase):
                 payload=b"<html>not a model</html>", model_format="cif"
             )
 
+    def test_named_model_copy_fallback(self) -> None:
+        """Keep accession-labelled output on file systems without hard links."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = downloader.prepare_output(directory=Path(directory) / "result")
+            asset = downloader.write_asset(
+                directory=output / "models", name="AF-P12345-F1.cif", payload=MODEL
+            )
+            with patch("fetch_alphafold_models.os.link", side_effect=OSError("no")):
+                alias = downloader.write_named_alias(
+                    output_dir=output,
+                    asset=asset,
+                    identifier="AAB61673.1",
+                    accession="P12345",
+                )
+            self.assertEqual((output / alias).read_bytes(), MODEL)
+            self.assertTrue(alias.startswith("by_input/AAB61673.1__P12345__"))
+
     def test_http_client_enforces_byte_limit(self) -> None:
         """A download larger than the configured ceiling is rejected."""
         client = downloader.HttpClient(timeout_seconds=2, retries=0)
@@ -318,7 +418,10 @@ class EndToEndTests(unittest.TestCase):
         """Write one model and PAE with separate auditable ID rows."""
         api = f"{downloader.AFDB_API_URL}/P12345"
         model_url = "https://alphafold.ebi.ac.uk/files/AF-P12345-F1-model_v6.cif"
-        pae_url = "https://alphafold.ebi.ac.uk/files/AF-P12345-F1-predicted_aligned_error_v6.json"
+        pae_url = (
+            "https://alphafold.ebi.ac.uk/files/"
+            "AF-P12345-F1-predicted_aligned_error_v6.json"
+        )
         client = StubClient(
             responses={
                 api: model_metadata(pae_url=pae_url),
@@ -346,6 +449,16 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual([row["status"] for row in rows], ["DOWNLOADED"] * 2)
             self.assertEqual(rows[0]["metadata_sequence_check"], "MATCH")
             self.assertEqual(rows[0]["model_path"], rows[1]["model_path"])
+            self.assertNotEqual(
+                rows[0]["named_model_path"], rows[1]["named_model_path"]
+            )
+            self.assertEqual(
+                (output / rows[0]["named_model_path"]).read_bytes(), MODEL
+            )
+            self.assertTrue(
+                rows[0]["named_model_path"].startswith("by_input/NP_001.1__P12345__")
+            )
+            self.assertTrue((output / rows[1]["named_pae_path"]).exists())
             self.assertEqual(rows[0]["pae_status"], "DOWNLOADED")
             self.assertEqual(client.calls.count(model_url), 1)
             self.assertEqual((output / rows[0]["model_path"]).read_bytes(), MODEL)
@@ -377,6 +490,38 @@ class EndToEndTests(unittest.TestCase):
             )
             self.assertEqual(rows[0]["status"], "SEQUENCE_MISMATCH")
             self.assertEqual(list((output / "models").iterdir()), [])
+            self.assertEqual(list((output / "by_input").iterdir()), [])
+
+    def test_genbank_mismatch_keeps_conversion_without_wrong_model(self) -> None:
+        """AAB61673.1 maps to BRCA1 but may not have its canonical sequence."""
+        client = StubClient(
+            responses={f"{downloader.AFDB_API_URL}/P38398": model_metadata(
+                accession="P38398",
+                model_url="https://alphafold.ebi.ac.uk/files/AF-P38398-F1-model_v6.cif",
+                sequence="MAKT",
+            )}
+        )
+
+        def mapper(**kwargs: object) -> dict[str, tuple[str, ...]]:
+            """Return the documented BRCA1 cross-reference."""
+            return {"AAB61673.1": ("P38398",)}
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = downloader.prepare_output(directory=Path(directory) / "result")
+            rows = downloader.download_models(
+                identifiers=("AAB61673.1",),
+                identifier_type="genbank-protein",
+                output_dir=output,
+                model_format="cif",
+                include_pae=False,
+                expected_sequences={"AAB61673.1": "MSS"},
+                client=client,
+                mapper=mapper,
+            )
+            self.assertEqual(rows[0]["uniprot_accession"], "P38398")
+            self.assertEqual(rows[0]["status"], "SEQUENCE_MISMATCH")
+            self.assertEqual(rows[0]["named_model_path"], "")
+            self.assertEqual(list((output / "by_input").iterdir()), [])
 
     def test_missing_model_and_unmapped_are_distinct(self) -> None:
         """Preserve unavailable and unmapped as separate non-failure outcomes."""
@@ -506,6 +651,48 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertTrue((output / "models" / Path(model_url).name).exists())
             self.assertIn("DOWNLOADED", (output / "manifest.tsv").read_text())
+
+    def test_cli_accepts_genbank_protein_fasta_and_names_model(self) -> None:
+        """A FASTA list is enough to map, check, and name each exact model."""
+        base = downloader.ID_MAPPING_URL
+        model_url = "https://alphafold.ebi.ac.uk/files/AF-P38398-F1-model_v6.cif"
+        client = StubClient(
+            responses={
+                f"{base}/run": b'{"jobId":"GB1"}',
+                f"{base}/status/GB1": b'{"jobStatus":"FINISHED"}',
+                f"{base}/stream/GB1": json.dumps(
+                    {"results": [
+                        {"from": "AAB61673.1", "to": {"primaryAccession": "P38398"}}
+                    ]}
+                ).encode("utf-8"),
+                f"{downloader.AFDB_API_URL}/P38398": model_metadata(
+                    accession="P38398", model_url=model_url
+                ),
+                model_url: b"data_AF-P38398-F1\n_atom_site.group_PDB\nATOM\n",
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            fasta = Path(directory) / "input.faa"
+            fasta.write_text(">AAB61673.1 example\nMAKT\n", encoding="utf-8")
+            output = Path(directory) / "result"
+            with patch("fetch_alphafold_models.HttpClient", return_value=client):
+                exit_code = downloader.main(argv=[
+                    "--id-type", "ncbi-protein", "--protein-fasta", str(fasta),
+                    "--output-dir", str(output),
+                ])
+            self.assertEqual(exit_code, 0)
+            with (output / "manifest.tsv").open(encoding="utf-8") as stream:
+                row = next(csv.DictReader(stream, delimiter="\t"))
+            self.assertEqual(row["metadata_sequence_check"], "MATCH")
+            self.assertEqual(row["uniprot_accession"], "P38398")
+            self.assertEqual(row["mapping_source"], "EMBL-GenBank-DDBJ_CDS")
+            self.assertTrue(
+                row["named_model_path"].startswith("by_input/AAB61673.1__P38398__")
+            )
+            self.assertEqual(
+                (output / row["named_model_path"]).read_bytes(),
+                (output / row["model_path"]).read_bytes(),
+            )
 
     def test_requested_pae_failure_is_visible(self) -> None:
         """Keep a valid model when optional PAE fails, marking the PAE error."""

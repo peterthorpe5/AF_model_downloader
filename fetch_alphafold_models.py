@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Retrieve published AlphaFold Database models from explicit protein identifiers.
 
-This is a standalone, standard-library-only command. NCBI Gene IDs and RefSeq
-protein accessions are resolved through UniProt's current ID mapping API. All
-mapped UniProt accessions are retained; none is selected by a guessed rank.
+This is a standalone, standard-library-only command. NCBI Gene IDs, RefSeq
+proteins and INSDC (GenBank/ENA/DDBJ) protein accessions are resolved through
+UniProt's ID mapping API. All mappings are retained without guessed ranking.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import sys
 import time
 from collections.abc import Callable, Iterable
@@ -41,10 +42,12 @@ MAX_PAE_BYTES = 200 * 1024 * 1024
 MANIFEST_FIELDS = (
     "input_id",
     "input_type",
+    "mapping_source",
     "uniprot_accession",
     "mapping_count",
     "status",
     "model_path",
+    "named_model_path",
     "model_sha256",
     "model_bytes",
     "model_url",
@@ -52,12 +55,14 @@ MANIFEST_FIELDS = (
     "model_version",
     "pae_status",
     "pae_path",
+    "named_pae_path",
     "pae_sha256",
     "metadata_sequence_check",
     "detail",
 )
 _UNIPROT_PATTERN = re.compile(r"[A-Z][A-Z0-9]{5}(?:[A-Z0-9]{4})?")
 _REFSEQ_PATTERN = re.compile(r"(?:NP|XP|YP|WP|ZP|AP)_\d+(?:\.\d+)?")
+_INSDC_PROTEIN_PATTERN = re.compile(r"[A-Z]{3}(?:\d{5}|\d{7})(?:\.\d+)?")
 _GENE_PATTERN = re.compile(r"[1-9]\d{0,11}")
 
 
@@ -212,9 +217,17 @@ def validate_identifier(*, value: str, identifier_type: str) -> str:
     patterns = {
         "uniprot": _UNIPROT_PATTERN,
         "refseq-protein": _REFSEQ_PATTERN,
+        "genbank-protein": _INSDC_PROTEIN_PATTERN,
         "gene-id": _GENE_PATTERN,
     }
-    if patterns[identifier_type].fullmatch(normalised) is None:
+    if identifier_type == "ncbi-protein":
+        valid = any(
+            pattern.fullmatch(normalised) is not None
+            for pattern in (_REFSEQ_PATTERN, _INSDC_PROTEIN_PATTERN)
+        )
+    else:
+        valid = patterns[identifier_type].fullmatch(normalised) is not None
+    if not valid:
         raise DownloadError(
             f"Invalid {identifier_type} identifier {value!r}; choose the "
             "correct --id-type and provide protein rather than nucleotide IDs"
@@ -253,8 +266,10 @@ def read_identifiers(
     return tuple(unique)
 
 
-def read_fasta(*, path: Path | None, identifiers: tuple[str, ...]) -> dict[str, str]:
-    """Read optional exact input protein sequences keyed by their original IDs."""
+def read_fasta(
+    *, path: Path | None, identifiers: tuple[str, ...] | None
+) -> dict[str, str]:
+    """Read protein FASTA; optionally require the exact requested ID set."""
     if path is None:
         return {}
     sequences: dict[str, str] = {}
@@ -290,13 +305,16 @@ def read_fasta(*, path: Path | None, identifiers: tuple[str, ...]) -> dict[str, 
         store_sequence()
     except (OSError, UnicodeError) as error:
         raise DownloadError(f"Cannot read FASTA {path}: {error}") from error
-    missing = set(identifiers) - sequences.keys()
-    unexpected = sequences.keys() - set(identifiers)
-    if missing or unexpected:
-        raise DownloadError(
-            f"FASTA IDs must equal requested IDs; missing={sorted(missing)}, "
-            f"unexpected={sorted(unexpected)}"
-        )
+    if identifiers is not None:
+        missing = set(identifiers) - sequences.keys()
+        unexpected = sequences.keys() - set(identifiers)
+        if missing or unexpected:
+            raise DownloadError(
+                f"FASTA IDs must equal requested IDs; missing={sorted(missing)}, "
+                f"unexpected={sorted(unexpected)}"
+            )
+    if not sequences:
+        raise DownloadError("Protein FASTA contains no sequences")
     return sequences
 
 
@@ -308,10 +326,55 @@ def map_identifiers(
     wait_seconds: float = 180.0,
     polling_seconds: float = 2.0,
 ) -> dict[str, tuple[str, ...]]:
-    """Map all NCBI IDs to UniProt without discarding one-to-many results."""
+    """Map one or more NCBI protein ID families without losing any matches."""
     if identifier_type == "uniprot":
         return {identifier: (identifier,) for identifier in identifiers}
-    source = {"refseq-protein": "RefSeq_Protein", "gene-id": "GeneID"}[identifier_type]
+    grouped: dict[str, list[str]] = {}
+    for identifier in identifiers:
+        grouped.setdefault(
+            mapping_source_for(identifier=identifier, identifier_type=identifier_type),
+            [],
+        ).append(identifier)
+    mapping: dict[str, tuple[str, ...]] = {}
+    for source, group in grouped.items():
+        LOGGER.info("Mapping %s input(s) using UniProt source %s", len(group), source)
+        mapping.update(
+            map_source_group(
+                identifiers=tuple(group),
+                source=source,
+                client=client,
+                wait_seconds=wait_seconds,
+                polling_seconds=polling_seconds,
+            )
+        )
+    return mapping
+
+
+def mapping_source_for(*, identifier: str, identifier_type: str) -> str:
+    """Return the UniProt source database for a validated input accession."""
+    if identifier_type == "uniprot":
+        return "DIRECT_UNIPROT"
+    if identifier_type == "gene-id":
+        return "GeneID"
+    if identifier_type == "refseq-protein" or (
+        identifier_type == "ncbi-protein"
+        and _REFSEQ_PATTERN.fullmatch(identifier) is not None
+    ):
+        return "RefSeq_Protein"
+    if identifier_type in {"genbank-protein", "ncbi-protein"}:
+        return "EMBL-GenBank-DDBJ_CDS"
+    raise DownloadError(f"Unsupported input type: {identifier_type}")
+
+
+def map_source_group(
+    *,
+    identifiers: tuple[str, ...],
+    source: str,
+    client: HttpClient,
+    wait_seconds: float,
+    polling_seconds: float,
+) -> dict[str, tuple[str, ...]]:
+    """Run one asynchronous UniProt mapping job for a homogeneous source."""
     submit = read_json(
         payload=client.read(
             url=f"{ID_MAPPING_URL}/run",
@@ -468,6 +531,36 @@ def write_asset(*, directory: Path, name: str, payload: bytes) -> DownloadedAsse
     )
 
 
+def write_named_alias(
+    *, output_dir: Path, asset: DownloadedAsset, identifier: str, accession: str
+) -> str:
+    """Expose a model under its submitted and UniProt IDs without re-fetching.
+
+    Hard links avoid storing repeated large coordinate files; on file systems
+    that do not permit links, the file is copied and published atomically.
+    """
+    name = f"{identifier}__{accession}__{Path(asset.path).name}"
+    destination = output_dir / "by_input" / name
+    if destination.exists():
+        raise DownloadError(f"Output file already exists: {destination}")
+    temporary = destination.with_name(f".{name}.{uuid4().hex}.tmp")
+    try:
+        source = output_dir / asset.path
+        try:
+            os.link(source, temporary)
+        except OSError:
+            with source.open("rb") as original, temporary.open("xb") as copy:
+                shutil.copyfileobj(original, copy)
+                copy.flush()
+                os.fsync(copy.fileno())
+        os.replace(temporary, destination)
+    except OSError as error:
+        raise DownloadError(f"Could not name file for {identifier}: {error}") from error
+    finally:
+        temporary.unlink(missing_ok=True)
+    return f"by_input/{name}"
+
+
 def new_row(
     *, identifier: str, identifier_type: str, accession: str = "", count: int = 0
 ) -> dict[str, str]:
@@ -476,6 +569,9 @@ def new_row(
     row.update(
         input_id=identifier,
         input_type=identifier_type,
+        mapping_source=mapping_source_for(
+            identifier=identifier, identifier_type=identifier_type
+        ),
         uniprot_accession=accession,
         mapping_count=str(count),
         pae_status="NOT_REQUESTED",
@@ -521,6 +617,7 @@ def prepare_output(*, directory: Path) -> Path:
     else:
         expanded.mkdir(parents=True)
     (expanded / "models").mkdir()
+    (expanded / "by_input").mkdir()
     return expanded.resolve()
 
 
@@ -660,13 +757,31 @@ def download_models(
                                 pae_status = "FAILED"
                     downloaded[accession] = (model, pae, pae_status)
                 model, pae, pae_status = downloaded[accession]
+                named_model = write_named_alias(
+                    output_dir=output_dir,
+                    asset=model,
+                    identifier=identifier,
+                    accession=accession,
+                )
+                named_pae = (
+                    write_named_alias(
+                        output_dir=output_dir,
+                        asset=pae,
+                        identifier=identifier,
+                        accession=accession,
+                    )
+                    if pae is not None
+                    else ""
+                )
                 row.update(
                     status="DOWNLOADED",
                     model_path=model.path,
+                    named_model_path=named_model,
                     model_sha256=model.digest,
                     model_bytes=str(model.size),
                     pae_status=pae_status,
                     pae_path="" if pae is None else pae.path,
+                    named_pae_path=named_pae,
                     pae_sha256="" if pae is None else pae.digest,
                 )
                 LOGGER.info("Model %s retrieved for input %s", accession, identifier)
@@ -687,11 +802,24 @@ def parse_args(*, argv: list[str] | None = None) -> argparse.Namespace:
     """Parse a named-argument command line for one identifier type."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--id-type", choices=("uniprot", "refseq-protein", "gene-id"), required=True
+        "--id-type",
+        choices=(
+            "uniprot",
+            "refseq-protein",
+            "genbank-protein",
+            "ncbi-protein",
+            "gene-id",
+        ),
+        required=True,
     )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--id", action="append", help="Repeat for several IDs")
     source.add_argument("--ids-file", type=Path, help="One ID per line, no header")
+    source.add_argument(
+        "--protein-fasta",
+        type=Path,
+        help="Protein FASTA with accession headers; verify sequences exactly",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--format", choices=("cif", "pdb"), default="cif")
     parser.add_argument("--include-pae", action="store_true")
@@ -699,7 +827,10 @@ def parse_args(*, argv: list[str] | None = None) -> argparse.Namespace:
         "--max-models",
         type=int,
         default=50,
-        help=f"Maximum distinct models to retrieve (default: 50; cap: {MAX_REQUESTED_MODELS})",
+        help=(
+            "Maximum distinct models to retrieve "
+            f"(default: 50; cap: {MAX_REQUESTED_MODELS})"
+        ),
     )
     parser.add_argument(
         "--sequence-fasta",
@@ -720,12 +851,24 @@ def main(*, argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     try:
-        identifiers = read_identifiers(
-            identifier_type=args.id_type,
-            ids=args.id or (),
-            ids_file=args.ids_file,
-        )
-        expected = read_fasta(path=args.sequence_fasta, identifiers=identifiers)
+        if args.protein_fasta is not None:
+            if args.sequence_fasta is not None:
+                raise DownloadError(
+                    "Use --protein-fasta alone, or --ids-file with --sequence-fasta"
+                )
+            expected = read_fasta(path=args.protein_fasta, identifiers=None)
+            identifiers = read_identifiers(
+                identifier_type=args.id_type,
+                ids=expected.keys(),
+                ids_file=None,
+            )
+        else:
+            identifiers = read_identifiers(
+                identifier_type=args.id_type,
+                ids=args.id or (),
+                ids_file=args.ids_file,
+            )
+            expected = read_fasta(path=args.sequence_fasta, identifiers=identifiers)
         client = HttpClient(
             timeout_seconds=args.timeout_seconds,
             retries=args.retries,

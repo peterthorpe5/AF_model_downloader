@@ -1,0 +1,2 @@
+# GenBank/INSDC CDS protein accession, not a RefSeq accession.
+AAB61673.1
