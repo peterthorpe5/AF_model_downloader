@@ -23,7 +23,7 @@ UniProt model. Use a protein FASTA to check sequence identity before download.
 
 ## Quick start: one or more accessions
 
-Unpack the ZIP, or git clone https://github.com/peterthorpe5/AF_model_downloader.git  and change to the `AF_model_downloader` directory.
+Unpack the ZIP, or git clone https://github.com/peterthorpe5/AF_model_downloader.git and change to the `AF_model_downloader` directory.
 
 ```bash
 python3 fetch_alphafold_models.py \

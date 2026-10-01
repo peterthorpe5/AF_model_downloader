@@ -76,7 +76,16 @@ class ModelUnavailable(DownloadError):
 
 @dataclass(frozen=True)
 class ModelReference:
-    """Validated AlphaFold Database resource for one UniProt accession."""
+    """Describe a validated AlphaFold Database resource.
+
+    Attributes:
+        accession: UniProt accession assigned to the model.
+        entry_id: Canonical AlphaFold Database F1 entry identifier.
+        version: Model release version extracted from its filename.
+        model_url: HTTPS URL for the selected coordinates.
+        pae_url: HTTPS URL for PAE data, when available.
+        sequence: UniProt sequence supplied by the model metadata, if present.
+    """
 
     accession: str
     entry_id: str
@@ -88,7 +97,13 @@ class ModelReference:
 
 @dataclass(frozen=True)
 class DownloadedAsset:
-    """Path and checksum of an immutable file written during this run."""
+    """Describe a file written during this run.
+
+    Attributes:
+        path: Path relative to the output directory.
+        digest: SHA-256 digest of the downloaded bytes.
+        size: Number of bytes written.
+    """
 
     path: str
     digest: str
@@ -107,7 +122,23 @@ class _BoundedRedirects(HTTPRedirectHandler):
         headers: Any,
         new_url: str,
     ) -> Request | None:
-        """Validate each redirect before urllib follows it."""
+        """Validate the redirected URL before allowing urllib to follow it.
+
+        Args:
+            request: Original HTTP request.
+            file_pointer: Response file object provided by urllib.
+            code: HTTP redirect status code.
+            message: HTTP status message.
+            headers: Headers supplied with the redirect.
+            new_url: Proposed redirect destination.
+
+        Returns:
+            A request for the approved redirect, or ``None`` if urllib
+            declines the redirect.
+
+        Raises:
+            DownloadError: If the destination is outside the approved host.
+        """
         original_host = urlparse(request.full_url).hostname
         validate_https_url(url=new_url, host=str(original_host))
         return super().redirect_request(
@@ -148,7 +179,15 @@ class HttpClient:
     """Read bounded HTTPS resources with timeouts, retries, and safe redirects."""
 
     def __init__(self, *, timeout_seconds: float = 30.0, retries: int = 3) -> None:
-        """Set finite HTTP limits and create a redirect-restricted opener."""
+        """Create a bounded client with an approved-host redirect handler.
+
+        Args:
+            timeout_seconds: Timeout for each HTTP attempt, in seconds.
+            retries: Maximum retries following a transient HTTP failure.
+
+        Raises:
+            DownloadError: If timeout or retry settings are invalid.
+        """
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0 or retries < 0:
             raise DownloadError("HTTP timeout must be positive; retries non-negative")
         self.timeout_seconds = timeout_seconds
@@ -163,7 +202,21 @@ class HttpClient:
         limit: int,
         form: dict[str, str] | None = None,
     ) -> bytes:
-        """Read at most ``limit`` bytes, retrying transient HTTP failures."""
+        """Read a bounded HTTPS response and retry transient failures.
+
+        Args:
+            url: HTTPS resource to request.
+            host: Exact approved host for the request and any redirect.
+            limit: Maximum number of response bytes to accept.
+            form: Form fields for a POST request, or ``None`` for GET.
+
+        Returns:
+            The response bytes, without modification.
+
+        Raises:
+            ModelUnavailable: If the server reports HTTP 404.
+            DownloadError: If the URL, response size, or request fails.
+        """
         validate_https_url(url=url, host=host)
         body = None if form is None else urlencode(form).encode("ascii")
         for attempt in range(self.retries + 1):
@@ -201,7 +254,18 @@ class HttpClient:
 
 
 def read_json(*, payload: bytes, label: str) -> dict[str, Any]:
-    """Decode a bounded UTF-8 JSON object returned by a remote service."""
+    """Decode a UTF-8 JSON object returned by a remote service.
+
+    Args:
+        payload: Raw response bytes from the service.
+        label: Service description used in validation errors.
+
+    Returns:
+        The decoded JSON object.
+
+    Raises:
+        DownloadError: If the bytes are not a valid JSON object.
+    """
     try:
         document = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -212,7 +276,18 @@ def read_json(*, payload: bytes, label: str) -> dict[str, Any]:
 
 
 def validate_identifier(*, value: str, identifier_type: str) -> str:
-    """Validate one identifier according to the explicit CLI input type."""
+    """Validate and normalise an accession for its declared input type.
+
+    Args:
+        value: Submitted accession or numeric NCBI Gene ID.
+        identifier_type: One of the supported ``--id-type`` choices.
+
+    Returns:
+        The stripped, uppercase identifier.
+
+    Raises:
+        DownloadError: If the identifier does not match its declared type.
+    """
     normalised = value.strip().upper()
     patterns = {
         "uniprot": _UNIPROT_PATTERN,
@@ -238,7 +313,20 @@ def validate_identifier(*, value: str, identifier_type: str) -> str:
 def read_identifiers(
     *, identifier_type: str, ids: Iterable[str], ids_file: Path | None
 ) -> tuple[str, ...]:
-    """Read and de-duplicate one explicit input type in its original order."""
+    """Read identifiers and keep unique entries in their input order.
+
+    Args:
+        identifier_type: Input type used to validate every identifier.
+        ids: Identifiers supplied directly on the command line.
+        ids_file: Optional UTF-8 file with one identifier per line.
+
+    Returns:
+        Unique, validated identifiers in their original order.
+
+    Raises:
+        DownloadError: If input cannot be read, is invalid, or exceeds
+            the maximum number of identifiers.
+    """
     requested = list(ids)
     if ids_file is not None:
         try:
@@ -269,7 +357,21 @@ def read_identifiers(
 def read_fasta(
     *, path: Path | None, identifiers: tuple[str, ...] | None
 ) -> dict[str, str]:
-    """Read protein FASTA; optionally require the exact requested ID set."""
+    """Read protein FASTA records keyed by their header accessions.
+
+    Args:
+        path: FASTA path, or ``None`` when no sequences were provided.
+        identifiers: Required set of accessions, or ``None`` to accept all
+            accessions from the FASTA file.
+
+    Returns:
+        Uppercase protein sequences keyed by uppercase accession; an empty
+        mapping if ``path`` is ``None``.
+
+    Raises:
+        DownloadError: If the file is invalid, contains duplicate IDs, or
+            does not match the requested accession set.
+    """
     if path is None:
         return {}
     sequences: dict[str, str] = {}
@@ -277,7 +379,11 @@ def read_fasta(
     parts: list[str] = []
 
     def store_sequence() -> None:
-        """Validate and save the current record without guessing isoforms."""
+        """Validate the current FASTA record and store its sequence.
+
+        Raises:
+            DownloadError: If its sequence is invalid or ID is duplicated.
+        """
         if identifier is None:
             return
         sequence = "".join(parts).upper().removesuffix("*")
@@ -326,7 +432,22 @@ def map_identifiers(
     wait_seconds: float = 180.0,
     polling_seconds: float = 2.0,
 ) -> dict[str, tuple[str, ...]]:
-    """Map one or more NCBI protein ID families without losing any matches."""
+    """Map input identifiers to all their UniProt accessions.
+
+    Args:
+        identifiers: Validated input accessions in their original order.
+        identifier_type: Declared type of the input identifiers.
+        client: Bounded HTTP client used for UniProt mapping requests.
+        wait_seconds: Maximum time allowed for each mapping job.
+        polling_seconds: Delay between mapping status checks.
+
+    Returns:
+        UniProt accessions grouped by each input identifier. Unmapped
+        identifiers have empty tuples.
+
+    Raises:
+        DownloadError: If an ID mapping job fails or returns invalid data.
+    """
     if identifier_type == "uniprot":
         return {identifier: (identifier,) for identifier in identifiers}
     grouped: dict[str, list[str]] = {}
@@ -351,7 +472,18 @@ def map_identifiers(
 
 
 def mapping_source_for(*, identifier: str, identifier_type: str) -> str:
-    """Return the UniProt source database for a validated input accession."""
+    """Select the UniProt mapping source for a validated input accession.
+
+    Args:
+        identifier: Validated accession or numeric NCBI Gene ID.
+        identifier_type: Declared input type, including mixed NCBI proteins.
+
+    Returns:
+        UniProt mapping source name, or ``DIRECT_UNIPROT`` for UniProt IDs.
+
+    Raises:
+        DownloadError: If the declared input type is unsupported.
+    """
     if identifier_type == "uniprot":
         return "DIRECT_UNIPROT"
     if identifier_type == "gene-id":
@@ -374,7 +506,21 @@ def map_source_group(
     wait_seconds: float,
     polling_seconds: float,
 ) -> dict[str, tuple[str, ...]]:
-    """Run one asynchronous UniProt mapping job for a homogeneous source."""
+    """Run one asynchronous UniProt mapping job for a single ID source.
+
+    Args:
+        identifiers: Accessions accepted by the same mapping source.
+        source: UniProt source database name for the mapping request.
+        client: Bounded HTTP client used to submit and poll the job.
+        wait_seconds: Maximum time to wait for the mapping result.
+        polling_seconds: Delay between status requests.
+
+    Returns:
+        All unique UniProt matches per input accession, sorted by accession.
+
+    Raises:
+        DownloadError: If the job fails, times out, or returns invalid data.
+    """
     submit = read_json(
         payload=client.read(
             url=f"{ID_MAPPING_URL}/run",
@@ -444,7 +590,20 @@ def map_source_group(
 def select_model(
     *, payload: bytes, accession: str, model_format: str
 ) -> ModelReference:
-    """Select a unique latest canonical F1 model from AlphaFold metadata."""
+    """Select the latest unique canonical F1 model from AlphaFold metadata.
+
+    Args:
+        payload: Raw AlphaFold Database prediction metadata in JSON format.
+        accession: UniProt accession expected in the metadata records.
+        model_format: Coordinate format, either ``cif`` or ``pdb``.
+
+    Returns:
+        Validated reference to the latest matching canonical F1 model.
+
+    Raises:
+        ModelUnavailable: If no matching canonical model exists.
+        DownloadError: If the metadata are invalid or latest records conflict.
+    """
     try:
         records = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -502,7 +661,16 @@ def select_model(
 
 
 def validate_model_bytes(*, payload: bytes, model_format: str) -> None:
-    """Reject empty responses, web pages, and clearly invalid coordinate text."""
+    """Reject responses that are clearly not model coordinate files.
+
+    Args:
+        payload: Downloaded model response bytes.
+        model_format: Expected coordinate format, ``cif`` or ``pdb``.
+
+    Raises:
+        DownloadError: If content is empty, binary, or lacks expected
+            coordinate markers.
+    """
     if not payload or b"\x00" in payload:
         raise DownloadError("Empty or binary coordinate response")
     if model_format == "cif":
@@ -513,7 +681,20 @@ def validate_model_bytes(*, payload: bytes, model_format: str) -> None:
 
 
 def write_asset(*, directory: Path, name: str, payload: bytes) -> DownloadedAsset:
-    """Publish one downloaded file atomically and report its SHA-256."""
+    """Write a model asset atomically and calculate its SHA-256 digest.
+
+    Args:
+        directory: Existing canonical ``models`` output directory.
+        name: Filename derived from a validated AlphaFold Database URL.
+        payload: Downloaded model or PAE response bytes.
+
+    Returns:
+        Relative path, checksum, and byte size of the stored file.
+
+    Raises:
+        DownloadError: If the target file already exists.
+        OSError: If the temporary file or atomic replacement cannot be written.
+    """
     destination = directory / name
     if destination.exists():
         raise DownloadError(f"Output file already exists: {destination}")
@@ -538,6 +719,18 @@ def write_named_alias(
 
     Hard links avoid storing repeated large coordinate files; on file systems
     that do not permit links, the file is copied and published atomically.
+
+    Args:
+        output_dir: Root directory containing ``models`` and ``by_input``.
+        asset: Canonical model or PAE asset already written to ``models``.
+        identifier: Original validated input accession.
+        accession: UniProt accession for the canonical asset.
+
+    Returns:
+        Path to the named file relative to ``output_dir``.
+
+    Raises:
+        DownloadError: If the named file already exists or cannot be written.
     """
     name = f"{identifier}__{accession}__{Path(asset.path).name}"
     destination = output_dir / "by_input" / name
@@ -564,7 +757,20 @@ def write_named_alias(
 def new_row(
     *, identifier: str, identifier_type: str, accession: str = "", count: int = 0
 ) -> dict[str, str]:
-    """Create a complete blank TSV row for one requested mapping."""
+    """Create an initial manifest row for an input and optional mapping.
+
+    Args:
+        identifier: Validated original input identifier.
+        identifier_type: Declared input identifier type.
+        accession: Resolved UniProt accession, if available.
+        count: Number of UniProt matches for the input identifier.
+
+    Returns:
+        Manifest row with every output field and default status values.
+
+    Raises:
+        DownloadError: If the identifier type has no mapping source.
+    """
     row = {key: "" for key in MANIFEST_FIELDS}
     row.update(
         input_id=identifier,
@@ -581,7 +787,18 @@ def new_row(
 
 
 def write_manifest(*, path: Path, rows: list[dict[str, str]]) -> None:
-    """Write an auditable TSV without tabs or newlines in remote error text."""
+    """Write an auditable TSV manifest using an atomic file replacement.
+
+    Tabs and newlines are removed from values to keep one output record per
+    line, including when remote error messages contain control characters.
+
+    Args:
+        path: Output manifest path.
+        rows: Model outcomes with keys from ``MANIFEST_FIELDS``.
+
+    Raises:
+        OSError: If the temporary manifest or replacement cannot be written.
+    """
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
         with temporary.open("x", encoding="utf-8", newline="") as stream:
@@ -607,7 +824,19 @@ def write_manifest(*, path: Path, rows: list[dict[str, str]]) -> None:
 
 
 def prepare_output(*, directory: Path) -> Path:
-    """Create a new empty output directory without altering prior results."""
+    """Create an empty output tree without overwriting previous results.
+
+    Args:
+        directory: Requested output directory, which must be new or empty.
+
+    Returns:
+        Resolved output directory containing ``models`` and ``by_input``.
+
+    Raises:
+        DownloadError: If the path is a symlink, a file, or a non-empty
+            directory.
+        OSError: If the output directories cannot be created.
+    """
     expanded = directory.expanduser()
     if expanded.is_symlink():
         raise DownloadError("Output directory must not be a symlink")
@@ -633,7 +862,26 @@ def download_models(
     max_models: int = 50,
     mapper: Callable[..., dict[str, tuple[str, ...]]] = map_identifiers,
 ) -> list[dict[str, str]]:
-    """Retrieve every mapped model and record each result, including failures."""
+    """Retrieve mapped models and write an outcome for every input mapping.
+
+    Args:
+        identifiers: Validated input identifiers in their original order.
+        identifier_type: Declared type of those identifiers.
+        output_dir: Prepared directory for models and the manifest.
+        model_format: Requested coordinate format, ``cif`` or ``pdb``.
+        include_pae: Whether to request available PAE JSON files.
+        expected_sequences: Optional exact protein sequences by input ID.
+        client: Bounded HTTP client for mapping and model requests.
+        max_models: Maximum number of distinct UniProt models to retrieve.
+        mapper: Callable that maps input IDs to UniProt accessions.
+
+    Returns:
+        Manifest rows, including unmapped, unavailable, and failed outcomes.
+        The same rows are written to ``manifest.tsv``.
+
+    Raises:
+        OSError: If the manifest cannot be written.
+    """
     try:
         if not 1 <= max_models <= MAX_REQUESTED_MODELS:
             raise DownloadError(
@@ -799,7 +1047,17 @@ def download_models(
 
 
 def parse_args(*, argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse a named-argument command line for one identifier type."""
+    """Parse named command-line options for model retrieval.
+
+    Args:
+        argv: Explicit argument list, or ``None`` to read ``sys.argv``.
+
+    Returns:
+        Parsed command-line options.
+
+    Raises:
+        SystemExit: If argparse encounters invalid options or ``--help``.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--id-type",
@@ -844,7 +1102,18 @@ def parse_args(*, argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(*, argv: list[str] | None = None) -> int:
-    """Run the CLI and return zero on a complete or known-missing request."""
+    """Run model retrieval and return a process exit status.
+
+    Args:
+        argv: Explicit argument list, or ``None`` to read ``sys.argv``.
+
+    Returns:
+        ``0`` for completed requests, ``1`` for recorded download or PAE
+        failures, or ``2`` for invalid input or a fatal setup error.
+
+    Raises:
+        SystemExit: If argparse encounters invalid options or ``--help``.
+    """
     args = parse_args(argv=argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

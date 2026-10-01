@@ -24,7 +24,17 @@ def model_metadata(
     sequence: str = "MAKT",
     pae_url: str | None = None,
 ) -> bytes:
-    """Build representative AlphaFold API metadata as UTF-8 JSON."""
+    """Build representative AlphaFold API metadata as UTF-8 JSON.
+
+    Args:
+        accession: UniProt accession associated with the fixture model.
+        model_url: HTTPS URL for the fixture coordinate file.
+        sequence: UniProt sequence returned in the fixture metadata.
+        pae_url: Optional HTTPS URL for the fixture PAE file.
+
+    Returns:
+        UTF-8 JSON bytes containing one AlphaFold prediction record.
+    """
     return json.dumps(
         [
             {
@@ -45,7 +55,11 @@ class StubClient:
     def __init__(
         self, *, responses: dict[str, bytes | Exception | list[bytes | Exception]]
     ) -> None:
-        """Store endpoint responses and calls for exact assertions."""
+        """Store fixed or sequential endpoint responses for test requests.
+
+        Args:
+            responses: URL-keyed bytes, exceptions, or sequences thereof.
+        """
         self.responses = responses
         self.calls: list[str] = []
         self.forms: list[dict[str, str] | None] = []
@@ -58,7 +72,22 @@ class StubClient:
         limit: int,
         form: dict[str, str] | None = None,
     ) -> bytes:
-        """Return a fixture or raise a configured service error."""
+        """Return a configured response and record the requested endpoint.
+
+        Args:
+            url: Requested endpoint URL.
+            host: Expected service host; unused by the fixture.
+            limit: Response byte limit; unused by the fixture.
+            form: Optional submitted mapping form, stored for assertions.
+
+        Returns:
+            Configured response bytes for the endpoint.
+
+        Raises:
+            Exception: If an exception fixture was configured for the URL.
+            KeyError: If the endpoint has no configured fixture.
+            IndexError: If all sequential fixtures have been consumed.
+        """
         self.calls.append(url)
         self.forms.append(form)
         response = self.responses[url]
@@ -73,18 +102,37 @@ class FakeResponse:
     """Implement a minimal context manager for bounded HTTP client tests."""
 
     def __init__(self, *, data: bytes) -> None:
-        """Keep the fake response payload."""
+        """Store the response bytes for bounded-read tests.
+
+        Args:
+            data: Complete response body for this fixture.
+        """
         self.data = data
 
     def __enter__(self) -> FakeResponse:
-        """Return this fake as a response stream."""
+        """Enter the fixture response context.
+
+        Returns:
+            This response object for bounded reads.
+        """
         return self
 
     def __exit__(self, *args: object) -> None:
-        """Exit without suppressing errors."""
+        """Exit the response context without suppressing exceptions.
+
+        Args:
+            *args: Exception context supplied by the ``with`` statement.
+        """
 
     def read(self, length: int) -> bytes:
-        """Honour the byte ceiling requested by the client."""
+        """Return up to the requested number of fixture bytes.
+
+        Args:
+            length: Maximum number of bytes to return.
+
+        Returns:
+            Response bytes truncated to ``length``.
+        """
         return self.data[:length]
 
 
@@ -92,12 +140,24 @@ class FakeOpener:
     """Record a request and return one fake response."""
 
     def __init__(self, *, response: bytes) -> None:
-        """Keep fake bytes for the next request."""
+        """Store bytes to return for the next HTTP request.
+
+        Args:
+            response: Fixture response body.
+        """
         self.response = response
         self.request: Request | None = None
 
     def open(self, request: Request, timeout: float) -> FakeResponse:
-        """Store the request for assertions and respond without I/O."""
+        """Record the request and return a context-managed fixture response.
+
+        Args:
+            request: HTTP request to retain for assertions.
+            timeout: Requested timeout; unused by the fixture.
+
+        Returns:
+            Response object containing the configured fixture bytes.
+        """
         self.request = request
         return FakeResponse(data=self.response)
 
@@ -106,12 +166,28 @@ class SequenceOpener:
     """Produce transient HTTP responses in a predictable order."""
 
     def __init__(self, *, responses: list[bytes | Exception]) -> None:
-        """Keep the response sequence and a count of network attempts."""
+        """Store responses to serve in order and count network attempts.
+
+        Args:
+            responses: Response bodies or errors in request order.
+        """
         self.responses = responses
         self.calls = 0
 
     def open(self, request: Request, timeout: float) -> FakeResponse:
-        """Return the next controlled response or raise its HTTP error."""
+        """Serve the next response or raise its configured exception.
+
+        Args:
+            request: HTTP request; unused by this sequential fixture.
+            timeout: Requested timeout; unused by this fixture.
+
+        Returns:
+            Response object containing the next fixture body.
+
+        Raises:
+            Exception: If the next fixture is an exception.
+            IndexError: If all configured responses have been consumed.
+        """
         response = self.responses[self.calls]
         self.calls += 1
         if isinstance(response, Exception):
@@ -431,7 +507,14 @@ class EndToEndTests(unittest.TestCase):
         )
 
         def mapper(**kwargs: object) -> dict[str, tuple[str, ...]]:
-            """Map two input IDs to one UniProt model for cache checking."""
+            """Map two input IDs to one UniProt model for cache checking.
+
+            Args:
+                **kwargs: Mapping options ignored by this fixture.
+
+            Returns:
+                Two input IDs mapped to the same UniProt accession.
+            """
             return {"NP_001.1": ("P12345",), "NP_002.1": ("P12345",)}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -473,7 +556,14 @@ class EndToEndTests(unittest.TestCase):
         client = StubClient(responses={api: model_metadata()})
 
         def mapper(**kwargs: object) -> dict[str, tuple[str, ...]]:
-            """Return one controlled RefSeq-to-UniProt mapping."""
+            """Return one controlled RefSeq-to-UniProt mapping.
+
+            Args:
+                **kwargs: Mapping options ignored by this fixture.
+
+            Returns:
+                A single RefSeq ID mapped to a UniProt accession.
+            """
             return {"NP_001.1": ("P12345",)}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -503,7 +593,14 @@ class EndToEndTests(unittest.TestCase):
         )
 
         def mapper(**kwargs: object) -> dict[str, tuple[str, ...]]:
-            """Return the documented BRCA1 cross-reference."""
+            """Return the documented BRCA1 cross-reference.
+
+            Args:
+                **kwargs: Mapping options ignored by this fixture.
+
+            Returns:
+                The GenBank accession mapped to the BRCA1 UniProt entry.
+            """
             return {"AAB61673.1": ("P38398",)}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -529,7 +626,14 @@ class EndToEndTests(unittest.TestCase):
         client = StubClient(responses={api: downloader.ModelUnavailable("HTTP 404")})
 
         def mapper(**kwargs: object) -> dict[str, tuple[str, ...]]:
-            """Return one model accession and one missing ID mapping."""
+            """Return one model accession and one missing ID mapping.
+
+            Args:
+                **kwargs: Mapping options ignored by this fixture.
+
+            Returns:
+                A UniProt mapping and an explicitly unmapped input.
+            """
             return {"7157": ("P12345",), "999": ()}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -554,7 +658,14 @@ class EndToEndTests(unittest.TestCase):
         client = StubClient(responses={})
 
         def mapper(**kwargs: object) -> dict[str, tuple[str, ...]]:
-            """Simulate UniProt being temporarily unavailable."""
+            """Simulate a temporary UniProt mapping failure.
+
+            Args:
+                **kwargs: Mapping options ignored by this fixture.
+
+            Raises:
+                DownloadError: Always, to simulate service failure.
+            """
             raise downloader.DownloadError("service temporarily unavailable")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -580,7 +691,14 @@ class EndToEndTests(unittest.TestCase):
         client = StubClient(responses={})
 
         def mapper(**kwargs: object) -> dict[str, tuple[str, ...]]:
-            """Return two candidate proteins for a single NCBI Gene ID."""
+            """Return two candidate proteins for a single NCBI Gene ID.
+
+            Args:
+                **kwargs: Mapping options ignored by this fixture.
+
+            Returns:
+                Both candidate UniProt accessions for one Gene ID.
+            """
             return {"7157": ("P12345", "Q12345")}
 
         with tempfile.TemporaryDirectory() as directory:
